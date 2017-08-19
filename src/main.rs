@@ -9,9 +9,12 @@ extern crate unicase;
 #[macro_use]
 extern crate log;
 extern crate env_logger;
+extern crate mongodb;
+extern crate bson;
+extern crate config;
 
-use std::sync::RwLock;
-use std::collections::btree_map::{BTreeMap, Iter};
+// use std::sync::RwLock;
+// use std::collections::btree_map::{BTreeMap, Iter};
 
 use unicase::UniCase;
 
@@ -31,9 +34,29 @@ use rustful::header::{
     Host
 };
 use rustful::StatusCode;
+use mongodb::{
+    Client,
+    ThreadedClient
+};
+use mongodb::coll::Collection;
+use mongodb::db::ThreadedDatabase;
+use mongodb::cursor::Cursor;
+use bson::{Bson, Document, encode_document, decode_document};
+use serde_json::Value;
+use config::Config;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::str::FromStr;
+
+use std::marker::PhantomData;
+use std::io;
+use std::env;
+use std::any::Any;
 
 fn main() {
     env_logger::init().unwrap();
+    let args: Vec<String> = env::args().collect();
+
+    let config = rd_config();
 
     let mut router = DefaultRouter::<Api>::new();
 
@@ -57,7 +80,7 @@ fn main() {
     router.find_hyperlinks = true;
 
     //Our imitation of a database
-    let database = RwLock::new(Table::new());
+    let database = Dummy::new();
 
     let server_result = Server {
         handlers: router,
@@ -78,6 +101,16 @@ fn main() {
       },
       Err(e) => error!("could not run the server: {}", e)
     };
+}
+
+fn rd_config () {
+    let mut config = Config::new();
+    config
+        .merge(config::File::with_name("config")).unwrap()
+        .merge(config::Environment::with_prefix("APP")).unwrap();
+    let addr = SocketAddr::new(
+        IpAddr::from_str(&config.get_str("bind_addr").unwrap()).unwrap(),
+        config.get_int("bind_port").unwrap() as u16);
 }
 
 //Errors that may occur while parsing the request
@@ -127,9 +160,9 @@ fn store(database: &Database, context: Context) -> Result<Option<String>, Error>
     let mut database = database.write().unwrap();
     database.insert(todo.into());
 
-    let todo = database.last().map(|(id, todo)| {
-        NetworkTodo::from_todo(todo, host, id)
-    });
+//    let todo = database.last().map(|(id, todo)| {
+//        NetworkTodo::from_todo(todo, host, id)
+//    });
 
     Ok(Some(serde_json::to_string(&todo).unwrap()))
 }
@@ -145,9 +178,9 @@ fn get_todo(database: &Database, context: Context) -> Result<Option<String>, Err
     let host = try!(context.headers.get().ok_or(Error::MissingHostHeader));
     let id = try!(context.variables.parse("id").map_err(|_| Error::BadId));
 
-    let todo = database.read().unwrap().get(id).map(|todo| {
-        NetworkTodo::from_todo(&todo, host, id)
-    });
+//    let todo = database.read().unwrap().get(id).map(|todo| {
+//        NetworkTodo::from_todo(&todo, host, id)
+//    });
 
     Ok(todo.map(|todo| serde_json::to_string(&todo).unwrap()))
 }
@@ -164,9 +197,9 @@ fn edit_todo(database: &Database, context: Context) -> Result<Option<String>, Er
     let mut todo = database.get_mut(id);
     todo.as_mut().map(|mut todo| todo.update(edits));
 
-    let todo = todo.map(|todo| {
-        NetworkTodo::from_todo(&todo, host, id)
-    });
+//    let todo = todo.map(|todo| {
+//        NetworkTodo::from_todo(&todo, host, id)
+//    });
 
     Ok(Some(serde_json::to_string(&todo).unwrap()))
 }
@@ -210,6 +243,87 @@ impl Handler for Api {
     }
 }
 
+fn json_value_from_cursor(cursor: Cursor) -> mongodb::Result<Value> {
+    let jsons: mongodb::Result<Vec<Value>> = cursor
+        .map(|doc| {
+            let json: Value = Bson::Document(doc?).into();
+            Ok(json)
+        })
+        .collect();
+
+    Ok(jsons.map(Value::Array)?)
+}
+
+fn get_budget(config: Config) {
+    let mongo = mongodb::Client::connect(&config.get_str("mongo_addr").unwrap(), config.get_int("mongo_port").unwrap() as u16)
+      .expect("Failed connect");
+    let coll = mongo.db("budget").collection("full");
+
+    let cursor = coll.find(None, None)
+          .ok().expect("find failed");
+
+    let json = json_value_from_cursor(cursor).expect("Unable to receive all documents from cursor");
+
+}
+
+type Database = Dummy;
+
+struct TNVData {
+    d: i32,
+}
+
+impl TNVData {
+    fn new() -> Self {
+        TNVData {
+            d: 0,
+        }
+    }
+    fn insert(&mut self, item: i32) {
+
+    }
+    fn delete (&mut self, id: usize) {
+
+    }
+    fn get_mut(&self, id: i32) {
+
+    }
+    fn clear(&self) {
+
+    }
+    fn get(&self, id: i32) {
+
+    }
+    fn iter(&self) -> Iter<> {
+
+    }
+}
+
+pub struct Dummy {
+    tnv: TNVData,
+}
+
+impl Dummy {
+    pub fn new() -> Self { // Dummy<TNVData> {
+        Dummy {
+            tnv: TNVData::new(),
+        }
+
+    }
+}
+impl Dummy {
+    pub fn read(&self) -> Result<TNVData, io::Error>{
+
+        Ok(self.tnv)
+    }
+    pub fn write(&self) -> Result<TNVData, io::Error> {
+        Ok(self.tnv)
+    }
+    pub fn insert(&self, itm: i32) {
+
+    }
+}
+
+/*
 //A read-write-locked Table will do as our database
 type Database = RwLock<Table>;
 
@@ -258,10 +372,10 @@ impl Table {
         (&self.items).iter()
     }
 }
-
+*/
 
 //A structure for what will be sent and received over the network
-#[derive(Serialize, Deserialize)]
+/*#[derive(Serialize, Deserialize)]
 struct NetworkTodo {
     title: Option<String>,
     completed: Option<bool>,
@@ -285,7 +399,7 @@ impl NetworkTodo {
         }
     }
 }
-
+*/
 
 //The stored to-do data
 struct Todo {
