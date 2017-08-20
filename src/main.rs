@@ -1,31 +1,39 @@
 #[macro_use]
 extern crate rustful;
-extern crate serde;
+#[macro_use]
+extern crate log;
+#[use_macro(bson, doc)]
+extern crate bson;
+#[macro_use]
 extern crate serde_json;
 #[macro_use]
 extern crate serde_derive;
+
+extern crate env_logger;
+extern crate config;
+extern crate mongodb;
 extern crate unicase;
 
-#[macro_use]
-extern crate log;
-extern crate env_logger;
-extern crate mongodb;
-extern crate bson;
-extern crate config;
+use std::io::{self, Read};
+use std::fs::File;
+use std::path::Path;
+use std::borrow::Cow;
+use std::error::Error as ErrorTrait;
 
-// use std::sync::RwLock;
-// use std::collections::btree_map::{BTreeMap, Iter};
+use rustful::StatusCode::{InternalServerError, BadRequest};
 
-use unicase::UniCase;
-
+use std::env;
+use config::Config;
 use rustful::{
     Server,
     Context,
     Response,
     Handler,
     DefaultRouter,
-    SendResponse
+    SendResponse,
+    ContentFactory
 };
+use rustful::server::Global;
 use rustful::header::{
     ContentType,
     AccessControlAllowOrigin,
@@ -42,14 +50,8 @@ use mongodb::coll::Collection;
 use mongodb::db::ThreadedDatabase;
 use mongodb::cursor::Cursor;
 use bson::{Bson, Document, encode_document, decode_document};
-use serde_json::Value;
-use config::Config;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::str::FromStr;
-
-use std::marker::PhantomData;
-use std::io;
-use std::env;
+use serde_json::value::Value;
+use unicase::UniCase;
 use std::any::Any;
 
 fn main() {
@@ -60,64 +62,66 @@ fn main() {
 
     let mut router = DefaultRouter::<Api>::new();
 
+    println!("Visit http://localhost:8080 to try this example.");
+
     //Global actions
     router.build().then().many(|mut endpoint| {
-        endpoint.on_get(Api(Some(list_all)));
-        endpoint.on_post(Api(Some(store)));
-        endpoint.on_delete(Api(Some(clear)));
-        endpoint.on_options(Api(None));
+        endpoint.on_get(Api(Some(base_get)));
+        endpoint.on_post(Api(Some(base_post)));
     });
 
     //Note actions
-    router.build().path(":id").then().many(|mut endpoint| {
-        endpoint.on_get(Api(Some(get_todo)));
-        endpoint.on_patch(Api(Some(edit_todo)));
-        endpoint.on_delete(Api(Some(delete_todo)));
-        endpoint.on_options(Api(None));
+    router.build().path(":tnv").then().many(|mut endpoint| {
+        endpoint.on_get(Api(Some(tnv_get)));
+        endpoint.on_post(Api(Some(tnv_post)));
+        endpoint.on_options(Api(Some(tnv_get)));
     });
 
     //Enables hyperlink search, which will be used in CORS
     router.find_hyperlinks = true;
 
     //Our imitation of a database
-    let database = Dummy::new();
+    let database: Box<TnvData> = Box::new(TnvData::new(config)).into();
 
+    //let mut gbl: Global = budget;
+    let mut gbl: Global = database.into();
+    //println!("{:?}", gbl.get());
+    //The ContentFactory wrapper allows simplified handlers that return their
+    //responses
     let server_result = Server {
         handlers: router,
+        threads: Some(1),
+        server: "tnv".to_string(),
         host: 8080.into(),
         content_type: content_type!(Application / Json; Charset = Utf8),
-        global: Box::new(database).into(),
+        global: gbl,
         ..Server::default()
     }.run();
 
+    //Check if the server started successfully
     match server_result {
-      Ok(server) => {
-        println!(
-          "This example is a showcase implementation of the Todo-Backend project (http://todobackend.com/), \
-          visit http://localhost:{0}/ to try it or run reference test suite by pointing \
-          your browser to http://todobackend.com/specs/index.html?http://localhost:{0}",
-          server.socket.port()
-        );
-      },
-      Err(e) => error!("could not run the server: {}", e)
-    };
+        Ok(_server) => {},
+        Err(e) => error!("could not start server: {}", e.description())
+    }
 }
 
-fn rd_config () {
+fn rd_config () -> Config {
     let mut config = Config::new();
     config
         .merge(config::File::with_name("config")).unwrap()
         .merge(config::Environment::with_prefix("APP")).unwrap();
-    let addr = SocketAddr::new(
-        IpAddr::from_str(&config.get_str("bind_addr").unwrap()).unwrap(),
-        config.get_int("bind_port").unwrap() as u16);
+//    let addr = SocketAddr::new(
+//        IpAddr::from_str(&config.get_str("bind_addr").unwrap()).unwrap(),
+//        config.get_int("bind_port").unwrap() as u16);
+    config
 }
 
-//Errors that may occur while parsing the request
 enum Error {
     ParseError,
     BadId,
     MissingHostHeader,
+    CouldNotReadBody,
+    MissingFileCache
 }
 
 impl<'a, 'b> SendResponse<'a, 'b> for Error {
@@ -125,94 +129,81 @@ impl<'a, 'b> SendResponse<'a, 'b> for Error {
 
     fn send_response(self, mut response: Response<'a, 'b>) -> Result<(), rustful::Error> {
         let message = match self {
+            Error::CouldNotReadBody => "Can not read body",
+            Error::MissingFileCache => "no files",
+//                error!("the global data should be of the type `Files`, but it's not");
+//                response.set_status(InternalServerError);
+//            },
             Error::ParseError => "Couldn't parse the todo",
             Error::BadId => "The 'id' parameter should be a non-negative integer",
             Error::MissingHostHeader => "No 'Host' header was sent",
         };
-
         response.headers_mut().set(ContentType(content_type!(Text / Plain; Charset = Utf8)));
         response.set_status(StatusCode::BadRequest);
         message.send_response(response)
+
+//        response.try_send("")
     }
 }
 
-
-
+#[derive(Serialize, Deserialize)]
+struct Person {
+    cmd: String,
+    host: String,
+}
 //List all the to-dos in the database
-fn list_all(database: &Database, context: Context) -> Result<Option<String>, Error> {
-    let host = try!(context.headers.get().ok_or(Error::MissingHostHeader));
+fn base_get(database: &Database, context: Context) -> Result<Option<String>, Error> {
+    let host: &Host = try!(context.headers.get().ok_or(Error::MissingHostHeader));
+    let bob = host.to_string();
 
-    let todos: Vec<_> = database.read().unwrap().iter()
-      .map(|(&id, todo)| NetworkTodo::from_todo(todo, host, id))
-      .collect();
+    let obj = Person {
+        cmd: "list_all".to_owned(),
+        host: bob, //+ host.port.unwrap_or(0).to_string()
+    };
+//    let todo = try!(
+//        serde_json::from_reader(context.body).map_err(|_| Error::ParseError)
+//    );
 
-    Ok(Some(serde_json::to_string(&todos).unwrap()))
+//    let todos: Vec<_> = database.read().unwrap().iter()
+//      .map(|(&id, todo)| NetworkTodo::from_todo(todo, host, id))
+//      .collect();
+
+//    Ok(Some(serde_json::to_string(&todos).unwrap())) */
+    let tmp = serde_json::to_string(&obj).unwrap();
+    Ok(Some(tmp))
 }
 
-//Store a new to-do with data from the request body
-fn store(database: &Database, context: Context) -> Result<Option<String>, Error> {
-    let todo: NetworkTodo = try!(
-        serde_json::from_reader(context.body).map_err(|_| Error::ParseError)
-    );
-
-    let host = try!(context.headers.get().ok_or(Error::MissingHostHeader));
-
-    let mut database = database.write().unwrap();
-    database.insert(todo.into());
-
-//    let todo = database.last().map(|(id, todo)| {
-//        NetworkTodo::from_todo(todo, host, id)
-//    });
-
-    Ok(Some(serde_json::to_string(&todo).unwrap()))
+fn cmd_login(database: &Database, context: Context, cmd: Value) {
+    let mongo = database.mongo;
+    let email = cmd["email"];
+//    if (email) {}
+    println!("LOGIN {:?}", email.as_str().unwrap());
+    let coll = mongo.db("tnv").collection("person");
+    let doc = doc! { "email" => email };
+    let cursor = coll.find(doc, None);
 }
 
-//Clear the database
-fn clear(database: &Database, _context: Context) -> Result<Option<String>, Error> {
-    database.write().unwrap().clear();
-    Ok(Some("".into()))
+fn tnv_post(database: &Database, context: Context) -> Result<Option<String>, Error> {
+    let todo: Value = try!(serde_json::from_reader(context.body).map_err(|_| Error::ParseError));
+    println!("{:?}", todo);
+    let obj = todo.as_object().unwrap();
+    let cmd = todo["cmd"].as_str().unwrap();
+    println!("{:?} {:?}", cmd, obj);
+    match cmd {
+        "login" => {cmd_login(database, context, todo)},
+        "pass" => {println!("PASS {:?}", todo["auth"].as_str().unwrap())},
+        "regdata" => {println!("REG {:?}", todo)}
+        _ => {},
+    }
+    let mut rslt = json!({"salt": "1023456", "nonce":"12345"});
+    Ok(Some(serde_json::to_string(&rslt).unwrap()))
 }
-
-//Send one particular to-do, selected by its id
-fn get_todo(database: &Database, context: Context) -> Result<Option<String>, Error> {
-    let host = try!(context.headers.get().ok_or(Error::MissingHostHeader));
-    let id = try!(context.variables.parse("id").map_err(|_| Error::BadId));
-
-//    let todo = database.read().unwrap().get(id).map(|todo| {
-//        NetworkTodo::from_todo(&todo, host, id)
-//    });
-
-    Ok(todo.map(|todo| serde_json::to_string(&todo).unwrap()))
+fn base_post(database: &Database, context: Context) -> Result<Option<String>, Error> {
+    Ok(Some(String::from(r#"{"cmd":"edit_todo"}"#)))
 }
-
-//Update a to-do, selected by its id with data from the request body
-fn edit_todo(database: &Database, context: Context) -> Result<Option<String>, Error> {
-    let edits: NetworkTodo = try!(
-        serde_json::from_reader(context.body).map_err(|_| Error::ParseError)
-    );
-    let host = try!(context.headers.get().ok_or(Error::MissingHostHeader));
-    let id = try!(context.variables.parse("id").map_err(|_| Error::BadId));
-
-    let mut database =  database.write().unwrap();
-    let mut todo = database.get_mut(id);
-    todo.as_mut().map(|mut todo| todo.update(edits));
-
-//    let todo = todo.map(|todo| {
-//        NetworkTodo::from_todo(&todo, host, id)
-//    });
-
-    Ok(Some(serde_json::to_string(&todo).unwrap()))
+fn tnv_get(database: &Database, context: Context) -> Result<Option<String>, Error> {
+    Ok(Some(String::from(r#"{"cmd":"delete_todo"}"#)))
 }
-
-//Delete a to-do, selected by its id
-fn delete_todo(database: &Database, context: Context) -> Result<Option<String>, Error> {
-    let id = try!(context.variables.parse("id").map_err(|_| Error::BadId));
-    database.write().unwrap().delete(id);
-    Ok(Some("".into()))
-}
-
-
-
 
 //An API endpoint with an optional action
 struct Api(Option<fn(&Database, Context) -> Result<Option<String>, Error>>);
@@ -236,7 +227,6 @@ impl Handler for Api {
             response.set_status(StatusCode::InternalServerError);
             return
         };
-
         if let Some(action) = self.0 {
             response.send(action(database, context));
         }
@@ -254,7 +244,12 @@ fn json_value_from_cursor(cursor: Cursor) -> mongodb::Result<Value> {
     Ok(jsons.map(Value::Array)?)
 }
 
-fn get_budget(config: Config) {
+fn init_mongo(config: &Config) -> Client {
+    mongodb::Client::connect(&config.get_str("mongo_addr").unwrap(), config.get_int("mongo_port").unwrap() as u16)
+      .expect("Failed connect")
+}
+
+fn get_budget(config: &Config) -> Value {
     let mongo = mongodb::Client::connect(&config.get_str("mongo_addr").unwrap(), config.get_int("mongo_port").unwrap() as u16)
       .expect("Failed connect");
     let coll = mongo.db("budget").collection("full");
@@ -262,174 +257,21 @@ fn get_budget(config: Config) {
     let cursor = coll.find(None, None)
           .ok().expect("find failed");
 
-    let json = json_value_from_cursor(cursor).expect("Unable to receive all documents from cursor");
-
+    json_value_from_cursor(cursor).expect("Unable to receive all documents from cursor")
 }
 
-type Database = Dummy;
+type Database = TnvData;
 
-struct TNVData {
-    d: i32,
+struct TnvData {
+    mongo: Client,
+    budget: Value,
 }
 
-impl TNVData {
-    fn new() -> Self {
-        TNVData {
-            d: 0,
-        }
-    }
-    fn insert(&mut self, item: i32) {
-
-    }
-    fn delete (&mut self, id: usize) {
-
-    }
-    fn get_mut(&self, id: i32) {
-
-    }
-    fn clear(&self) {
-
-    }
-    fn get(&self, id: i32) {
-
-    }
-    fn iter(&self) -> Iter<> {
-
-    }
-}
-
-pub struct Dummy {
-    tnv: TNVData,
-}
-
-impl Dummy {
-    pub fn new() -> Self { // Dummy<TNVData> {
-        Dummy {
-            tnv: TNVData::new(),
-        }
-
-    }
-}
-impl Dummy {
-    pub fn read(&self) -> Result<TNVData, io::Error>{
-
-        Ok(self.tnv)
-    }
-    pub fn write(&self) -> Result<TNVData, io::Error> {
-        Ok(self.tnv)
-    }
-    pub fn insert(&self, itm: i32) {
-
-    }
-}
-
-/*
-//A read-write-locked Table will do as our database
-type Database = RwLock<Table>;
-
-//A simple imitation of a database table
-struct Table {
-    next_id: usize,
-    items: BTreeMap<usize, Todo>
-}
-
-impl Table {
-    fn new() -> Table {
-        Table {
-            next_id: 0,
-            items: BTreeMap::new()
-        }
-    }
-
-    fn insert(&mut self, item: Todo) {
-        self.items.insert(self.next_id, item);
-        self.next_id += 1;
-    }
-
-    fn delete(&mut self, id: usize) {
-        self.items.remove(&id);
-    }
-
-    fn clear(&mut self) {
-        self.items.clear();
-    }
-
-    fn last(&self) -> Option<(usize, &Todo)> {
-        self.items.keys().next_back().cloned().and_then(|id| {
-            self.items.get(&id).map(|item| (id, item))
-        })
-    }
-
-    fn get(&self, id: usize) -> Option<&Todo> {
-        self.items.get(&id)
-    }
-
-    fn get_mut(&mut self, id: usize) -> Option<&mut Todo> {
-        self.items.get_mut(&id)
-    }
-
-    fn iter(&self) -> Iter<usize, Todo> {
-        (&self.items).iter()
-    }
-}
-*/
-
-//A structure for what will be sent and received over the network
-/*#[derive(Serialize, Deserialize)]
-struct NetworkTodo {
-    title: Option<String>,
-    completed: Option<bool>,
-    order: Option<u32>,
-    url: Option<String>
-}
-
-impl NetworkTodo {
-    fn from_todo(todo: &Todo, host: &Host, id: usize) -> NetworkTodo {
-        let url = if let Some(port) = host.port {
-            format!("http://{}:{}/{}", host.hostname, port, id)
-        } else {
-            format!("http://{}/{}", host.hostname, id)
-        };
-
-        NetworkTodo {
-            title: Some(todo.title.clone()),
-            completed: Some(todo.completed),
-            order: Some(todo.order),
-            url: Some(url)
-        }
-    }
-}
-*/
-
-//The stored to-do data
-struct Todo {
-    title: String,
-    completed: bool,
-    order: u32
-}
-
-impl Todo {
-    fn update(&mut self, changes: NetworkTodo) {
-        if let Some(title) = changes.title {
-            self.title = title;
-        }
-
-        if let Some(completed) = changes.completed {
-            self.completed = completed;
-        }
-
-        if let Some(order) = changes.order {
-            self.order = order
-        }
-    }
-}
-
-impl From<NetworkTodo> for Todo {
-    fn from(todo: NetworkTodo) -> Todo {
-        Todo {
-            title: todo.title.unwrap_or(String::new()),
-            completed: todo.completed.unwrap_or(false),
-            order: todo.order.unwrap_or(0)
+impl TnvData {
+    fn new(config: Config) -> Self {
+        TnvData {
+            mongo: init_mongo(&config),
+            budget: get_budget(&config),
         }
     }
 }

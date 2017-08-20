@@ -1,0 +1,4 @@
+bind_addr = "0.0.0.0"
+bind_port = 8181
+mongo_addr = "10.0.42.81"
+mongo_port = 27017
