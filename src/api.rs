@@ -74,8 +74,7 @@ pub struct RustCmd {
 }
 
 impl RustCmd {
-  fn new(jc: JsonCmd) -> RustCmd {
-    let (pkey, skey) = box_::gen_keypair();
+  fn new(jc: JsonCmd, pkey: PublicKey) -> RustCmd {
 
     let rc = RustCmd {
       cmd: jc.cmd,
@@ -164,65 +163,6 @@ struct TmpLogin {
   salt: Option<String>,  // The ID of the user, only decode during verification
   role: i32,
 }
-
-impl TmpLogin {
-  fn from_doc(&self, doc: Document) -> Result<TmpLogin, Error> {
-    let tmplogin = TmpLogin {
-      sess: doc.get_str("sess").unwrap().to_string(),
-      addr: doc.get_str("addr").unwrap().to_string(),
-      start: doc.get_i64("start").unwrap(),
-      last: doc.get_i64("last").unwrap(),
-      prekey: PrecomputedKey::from_slice(doc.get_binary_generic("prekey").unwrap()).unwrap(),
-      nonce: doc.get_str("nonce").unwrap().to_string(),
-      salt: match doc.get_str("salt") {
-          Ok(s) => {
-            Some(s.to_string())
-          },
-          Err(e) => None,
-      },
-      role: 0
-    };
-    Ok(tmplogin)
-  }
-  fn into_doc(&self) -> Result<Document, Error> {
-    Ok(Document::new())
-  }
-}
-
-impl From<Document> for TmpLogin {
-  fn from(doc: Document) -> TmpLogin {
-    let val = TmpLogin {
-      sess: doc.get_str("sess").unwrap().to_string(),
-      addr: doc.get_str("addr").unwrap().to_string(),
-      start: doc.get_i64("start").unwrap(),
-      last: doc.get_i64("last").unwrap(),
-      prekey: PrecomputedKey::from_slice(&decode(doc.get_str("prekey").unwrap()).unwrap()).unwrap(),
-      nonce: doc.get_str("nonce").unwrap().to_string(),
-      salt: doc.get_str("salt").map(|s| s.to_string()).ok(),
-      role: doc.get_i32("role").unwrap(),
-    };
-    val
-  }
-}
-
-/*
-impl From<TmpLogin> for Document {
-  fn from(tl: TmpLogin) -> Document {
-    let last = DateTime::timestamp(&Utc::now());
-    let doc = doc! {
-      "sess" => = { tl.sess },
-      "addr" => (tl.addr),
-      "start" => (tl.start),
-      "last" => last,
-      "prekey" => ,
-      "nonce" => (tl.nonce),
-      "salt" => (tl.salt),
-      "role" => (tl.role),
-    };
-    doc
-  }
-}
-*/
 
 pub fn build_router() -> MethodRouter<Api> {
   let mut router = MethodRouter::<Api>::new();
@@ -322,7 +262,7 @@ pub fn tnv_post(tnvdata: &Database, mut context: Context) -> Result<Option<Strin
         None => {
           let mut rec;
           if rpc.cmd == "hello" {  // log new session
-            rec = new_sess(rpc, coll);
+            rec = new_sess(rpc, coll, );
             println!("new {:?}", rec);
           } else {    // bad hacking
             println!("hacking {:?}", rpc);
