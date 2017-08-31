@@ -74,17 +74,24 @@ pub struct RustCmd {
 }
 
 impl RustCmd {
-  fn new(jc: JsonCmd, pkey: PublicKey) -> RustCmd {
+  fn new(jc: JsonCmd, skey: &SecretKey) -> RustCmd {
+    // assume jc.cmd == "hello"
+    let params = jc.params.clone();
+    let obj = jc.params.as_object().unwrap();
+    let hello = obj.get("hello").unwrap();
+    let pkey = &PublicKey::from_slice(&decode(&jc.sess).unwrap()).unwrap();
+//    PublicKey(decode(&cmd.key).unwrap().as_str()).unwrap();
+//    let prekey = &box_::precompute(ckey, &skey);
 
     let rc = RustCmd {
       cmd: jc.cmd,
       id: jc.id,
       key: jc.sess,
-      params: jc.params,
+      params: params,
       start: DateTime::timestamp(&Utc::now()),
       last: DateTime::timestamp(&Utc::now()),
-      nonce: String::new(),
-      prekey: box_::precompute(&pkey, &skey),
+      nonce: hello.to_string(),
+      prekey: box_::precompute(&pkey, skey),
       role: 0,
       person: None,
       state: 1,
@@ -262,7 +269,8 @@ pub fn tnv_post(tnvdata: &Database, mut context: Context) -> Result<Option<Strin
         None => {
           let mut rec;
           if rpc.cmd == "hello" {  // log new session
-            rec = new_sess(rpc, coll, );
+            let (pkey, ref skey) = tnvdata.key;
+            rec = new_sess(rpc, skey);
             println!("new {:?}", rec);
           } else {    // bad hacking
             println!("hacking {:?}", rpc);
@@ -289,8 +297,8 @@ pub fn tnv_post(tnvdata: &Database, mut context: Context) -> Result<Option<Strin
     }
 }
 
-fn new_sess(rpc: JsonCmd, coll: Collection) -> RustCmd {
-  let cmd = RustCmd::new(rpc);
+fn new_sess(rpc: JsonCmd, skey: &SecretKey) -> RustCmd {
+  let cmd = RustCmd::new(rpc, skey);
   cmd
 }
 
