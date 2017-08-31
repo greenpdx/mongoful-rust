@@ -159,17 +159,6 @@ pub enum Error {
     MissingFileCache,
     CmdNotFound,
 }
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct TmpLogin {
-  sess: String,  // client session base64 encoded sodiumoxide PublicKey
-  addr: String,  // remote address for hacking issues
-  start: i64,   // session start time
-  last: i64,   // last access
-  prekey: PrecomputedKey,
-  nonce: String,  // session nonce base64 encoded
-  salt: Option<String>,  // The ID of the user, only decode during verification
-  role: i32,
-}
 
 pub fn build_router() -> MethodRouter<Api> {
   let mut router = MethodRouter::<Api>::new();
