@@ -32,6 +32,8 @@ mod api;
 mod filter;
 mod tnvdata;
 mod tnvconfig;
+mod person;
+mod rustcmd;
 
 use tnvdata::{TnvData};
 use api::{build_router};

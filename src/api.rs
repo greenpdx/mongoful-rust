@@ -51,113 +51,23 @@ use unicase::UniCase;
 
 use tnvdata::{Database, TnvData};
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
-pub struct JsonCmd {
-    cmd: String,
-    id: String,
-    sess: String,
-    params: Value,
-}
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct RustCmd {
-  cmd: String,
-  id: String,
-  key: String,
-  params: Value,
-  start: i64,
-  last: i64,
-  nonce: String,
-  prekey: PrecomputedKey,
-  role: i32,
-  person: Option<Person>,
-  state: i32,
-}
+use person::Person;
+use rustcmd::RustCmd;
+use rustcmd::JsonCmd;
 
-impl RustCmd {
-  fn new(jc: JsonCmd, skey: &SecretKey) -> RustCmd {
-    // assume jc.cmd == "hello"
-    let params = jc.params.clone();
-    let obj = jc.params.as_object().unwrap();
-    let hello = obj.get("hello").unwrap();
-    let pkey = &PublicKey::from_slice(&decode(&jc.sess).unwrap()).unwrap();
-//    PublicKey(decode(&cmd.key).unwrap().as_str()).unwrap();
-//    let prekey = &box_::precompute(ckey, &skey);
-
-    let rc = RustCmd {
-      cmd: jc.cmd,
-      id: jc.id,
-      key: jc.sess,
-      params: params,
-      start: DateTime::timestamp(&Utc::now()),
-      last: DateTime::timestamp(&Utc::now()),
-      nonce: hello.to_string(),
-      prekey: box_::precompute(&pkey, skey),
-      role: 0,
-      person: None,
-      state: 1,
-    };
-    rc
-  }
-}
-/*impl From<JsonCmd> for RustCmd {
-  fn from(json: JsonCmd) -> RustCmd {
-    let key: &[u8] = &decode(&json.sess).unwrap();
-    let rtn = RustCmd {
-      cmd: json.cmd,
-      id: json.id,
-      key: json.sess,
-      params: json.params,
-      start: DateTime::timestamp(&Utc::now()),
-      last: DateTime::timestamp(&Utc::now()),
-      nonce: String::new(),
-      prekey: PrecomputedKey::from_slice(&[0,32]).unwrap(),
-      role: -1,
-      person: None,
-      state: 0,
-    };
-    rtn
-  }
-}*/
-impl From<Document> for RustCmd {
-  fn from(doc: Document) -> RustCmd {
-    let rtn = RustCmd {
-      cmd:  String::new(),
-      id:  String::new(),
-      key:  doc.get_str("key").unwrap().to_string(),
-      params: json!(null),
-      start: doc.get_i64("start").unwrap(),
-      last: DateTime::timestamp(&Utc::now()),
-      nonce:  doc.get_str("nonce").unwrap().to_string(),
-      prekey: PrecomputedKey::from_slice(doc.get_binary_generic("prekey").unwrap()).unwrap(),
-      role: doc.get_i32("role").unwrap(),
-      person: None,
-      state: doc.get_i32("state").unwrap(),
-    };
-    rtn
-  }
-}
-/* impl From<RustCmd> for Bson {
-  fn from(cmd: RustCmd) -> Bson {
-
-  }
-} */
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct Person {
-  email: String,    // EMail
-  salt: Nonce,
-  hpass: Nonce,
-  fname: String,
-  role: i32,
-}
-
+#[derive(Debug, Clone)]
 pub enum Error {
     ParseError,
     BadId,
     MissingHostHeader,
     CouldNotReadBody,
-    MissingFileCache,
-    CmdNotFound,
+    MethodNotFound,
+    InvalidRequest,
+    InvalidParams,
+    InternalError,
+    ServerError,
+    Hacking,
+    BadSess,
 }
 
 pub fn build_router() -> MethodRouter<Api> {
@@ -177,14 +87,16 @@ impl<'a, 'b> SendResponse<'a, 'b> for Error {
     fn send_response(self, mut response: Response<'a, 'b>) -> Result<(), rustful::Error> {
         let message = match self {
             Error::CouldNotReadBody => "Can not read body",
-            Error::MissingFileCache => "no files",
-//                error!("the global data should be of the type `Files`, but it's not");
-//                response.set_status(InternalServerError);
-//            },
-            Error::ParseError => "Couldn't parse the todo",
+            Error::ParseError => "Couldn't parse the command",
             Error::BadId => "The 'id' parameter should be a non-negative integer",
             Error::MissingHostHeader => "No 'Host' header was sent",
-            Error::CmdNotFound => "Command Not Found",
+            Error::MethodNotFound => "Method Not Found",
+            Error::InvalidRequest => "Invalid Request",
+            Error::InvalidParams => "Invalid Parameters",
+            Error::InternalError => "Internal Error",
+            Error::ServerError => "Server_error",
+            Error::Hacking => "Stop This",
+            Error::BadSess => "Invalid Session"
         };
         response.headers_mut().set(ContentType(content_type!(Text / Plain; Charset = Utf8)));
         response.set_status(StatusCode::BadRequest);
@@ -226,22 +138,20 @@ fn tnv_get(tnvdata: &Database, context: Context) -> Result<Option<String>, Error
     Ok(Some(String::from(r#"{"cmd":"delete_todo"}"#)))
 }
 
-
-
 ///
 ///
 pub fn tnv_post(tnvdata: &Database, mut context: Context) -> Result<Option<String>, Error> {
     let rpc: JsonCmd = try!(serde_json::from_reader(&mut context.body).map_err(|_| Error::ParseError));
     let sess = &rpc.sess.clone();
-
+    println!("POST {:?}", rpc );
     let mongo = &tnvdata.mongo;
     let coll = mongo.db("tmp").collection("cmd");
     let doc = doc! { "key" => sess };
     let now = DateTime::timestamp(&Utc::now());
 
-    let update = doc! { "last" => now };
+    let update = doc! { "$set" => { "last" => now }};
     let item = coll.find_one_and_update( doc.clone(), update.clone(), None).unwrap();
-    let cmd: RustCmd = match item {
+    let mut cmd: RustCmd = match item {
         Some(doc) => {
           //let tst: Value = Bson::Document(doc).clone().into();
           let mut rec = RustCmd::from(doc);
@@ -250,6 +160,12 @@ pub fn tnv_post(tnvdata: &Database, mut context: Context) -> Result<Option<Strin
           rec.params = rpc.params;
           if rec.cmd == "hello" { // found match and also hello, bad
             println!("Found and hello {:?}", rec);
+            let doc = doc! { "key" => sess };
+            let inc = doc! { "$inc" => { "state" => 1}};
+            coll.update_one(doc.clone(), inc.clone(), None);
+            if rec.state > 5 {
+              return Err(Error::Hacking);
+            }
           } else { // found match, normal processing
             println!("Found, normal {:?}", rec);
           };
@@ -263,26 +179,30 @@ pub fn tnv_post(tnvdata: &Database, mut context: Context) -> Result<Option<Strin
             println!("new {:?}", rec);
           } else {    // bad hacking
             println!("hacking {:?}", rpc);
-            return Err(Error::CmdNotFound);
+            return Err(Error::Hacking);
           };
           rec
         }
     };
-    println!("{:?}", cmd );
     let rtn = match cmd.cmd.as_ref() {
         "hello" => {cmd_hello(tnvdata, context, &cmd)},
         "login" => {cmd_login(tnvdata, context, &cmd)},
         "pass" => {cmd_pass(tnvdata, context, &cmd)},
+        "create" => {cmd_create(tnvdata, context, &mut cmd)},
         "regdata" => {cmd_regdata(tnvdata, context, &cmd)},
-        _ => Err(Error::CmdNotFound)
+        _ => Err(Error::MethodNotFound)
     };
     match rtn {
       Ok(v) => {
         let id = cmd.id;
         let rslt = json!({"id": id, "result": v});
+        println!("SEND {:?} {:?}", cmd.cmd, rslt );
         Ok(Some(serde_json::to_string(&rslt).unwrap()))
       },
-      Err(e) => Err(e)
+      Err(e) => {
+        println!("{:?}", e);
+        Err(e)
+      }
     }
 }
 
@@ -292,21 +212,14 @@ fn new_sess(rpc: JsonCmd, skey: &SecretKey) -> RustCmd {
 }
 
 
-fn load_person(salt: String, mongo: &Client) -> Option<Person> {
+fn person_salt(salt: String, mongo: &Client) -> Option<Person> {
   let coll = mongo.db("tnv").collection("person");
   let doc = doc! { "salt" => salt };
   let mut item = coll.find_one( Some(doc.clone()), None).unwrap();
 //              let item = cursor.next();
   let person: Option<Person> = match item {
     Some(p) => {
-      let person = Person {
-        email: "".to_string(),
-        hpass: box_::gen_nonce(),
-        salt: box_::gen_nonce(),
-        fname: "".to_string(),
-        role: 0,
-      };
-
+      let person = Person::new(json!({}), json!({}));
       Some(person)
     },
     None => {
@@ -329,7 +242,7 @@ fn cmd_login(tnvdata: &Database, context: Context, mut cmd: &RustCmd) -> Result<
     Some(p) => {
       let salt = "gggg".to_string();
       let nonce = "mmmm".to_string();
-      json!({ "salt": salt, "nonce": nonce })
+      json!({ "id": salt, "nonce": nonce })
     },
     None => {
       println!("Not Found {:?}", email);
@@ -346,8 +259,61 @@ fn cmd_pass(tnvdata: &Database, context: Context, mut cmd: &RustCmd) -> Result<V
     Ok(rslt)
 }
 
+fn cmd_create(tnvdata: &Database, context: Context, mut cmd: &mut RustCmd) -> Result<Value, Error> {
+  println!("CREATE {:?}", cmd);
+  let params = cmd.params.as_object().unwrap();
+  let email = params.get("email").unwrap().as_str().unwrap();
+
+  let mongo = &tnvdata.mongo;
+  let coll = mongo.db("tnv").collection("person");
+
+  let doc = doc! { "email" => email };
+  let item = coll.find_one(Some(doc.clone()), None).unwrap();
+
+  let rslt: Value = match item {
+    Some(p) => {
+      json!({ "nonce": "Try another"})
+    },
+    None => {
+      let salt = encode(&box_::gen_nonce());
+      let nonce = encode(&box_::gen_nonce());
+      let coll = mongo.db("tmp").collection("cmd");
+      let doc = doc! { "key" => (&cmd.key) };
+      let set = doc! { "$set" => { "nonce" => email, "idx" => (salt.clone()) }};
+      coll.update_one(doc.clone(), set.clone(), None);
+      json!({ "salt": salt, "nonce": nonce })
+    }
+
+  };
+
+  Ok(rslt)
+}
+
 fn cmd_regdata(tnvdata: &Database, context: Context, mut cmd: &RustCmd) -> Result<Value, Error> {
-    let mut rslt = json!({"salt": "1023456", "nonce":"12345"});
+    println!("REGDATA {:?}", cmd);
+    let mut params = cmd.params.clone();
+    let email = &cmd.nonce;
+    let salt = &cmd.idx;
+
+    let mongo = &tnvdata.mongo;
+    let coll = mongo.db("tnv").collection("person");
+    let doc = doc! { "email" => email};
+    let item = coll.find_one(Some(doc.clone()), None).unwrap();
+    let rslt: Value = match item {
+      Some(p) => {  //error
+        return Err(Error::InvalidParams)
+      },
+      None => {   //should not be found
+        // fname, lname, phon, age, hpass, wealth, social, fiscal
+        let person = Person::from(params);
+        println!("PERSON {:?}", person );
+        let doc = person.to_bson();
+        let rtn = coll.insert_one(doc.clone(), None);
+        let sess = encode(&box_::gen_nonce()[ .. ]);
+        json!({"sess": "Ok"})
+      }
+
+    };
     Ok(rslt)
 }
 
@@ -361,32 +327,38 @@ fn cmd_hello(tnvdata: &Database, context: Context, mut cmd: &RustCmd) -> Result<
   let params = cmd.params.as_object().unwrap();
   let hello = params.get("hello").unwrap().as_str().unwrap();
 
-  let (pkey, ref skey) = tnvdata.key;
-  if cmd.role <= 0 {    //
+  let rtn = encode(&box_::gen_nonce()[ .. ]);
 
-    let ckey = &PublicKey::from_slice(&decode(&cmd.key).unwrap()).unwrap();
-//    PublicKey(decode(&cmd.key).unwrap().as_str()).unwrap();
-    let prekey = &box_::precompute(ckey, &skey);
-    let fast = encode(&prekey[ .. ]);
+  let mongo = &tnvdata.mongo;
+  let coll = mongo.db("tmp").collection("cmd");
 
-    let addr = format!("{}", context.address.ip());
-    let ts = DateTime::timestamp(&Utc::now());
-    let sess = &cmd.key;
+  let rslt: Value = if cmd.state <= 1 {
+    let person = String::new();  // Bson!(cmd.person);
 
-    let mongo = &tnvdata.mongo;
-    let coll = mongo.db("tmp").collection("login");
+    coll.insert_one(doc!{
+      "key" => (&cmd.key),
+      "addr" => (format!("{}", context.address.ip())),
+      "start" => (cmd.start),
+      "last" => (cmd.last),
+      "nonce" => (&cmd.nonce),
+      "idx" => (&cmd.id),
+      "prekey" => (encode(&cmd.prekey[ .. ])),
+      "role" => (cmd.role),
+      "person" => (String::new()),  // Bson!(cmd.person) or email
+      "state" => 1 }, None).unwrap();
 
-    println!("HELLO {:?} {} {:?}", pkey, addr, prekey);
+      json!({
+        "hello": cmd.key,
+        "nonce": encode(&rtn),
+      })
+  } else {
+    json!({
+      "hello": cmd.key,
+      "nonce": encode(&rtn),
+    })
 
-    coll.insert_one(doc!{"sess" => sess, "addr" => addr, "ts" => ts, "prekey" => fast, "nonce" => hello, "role" => 0, "salt" => Null }, None).unwrap();
-
+  };
 //      coll.insert_one(doc!{"sess" => sess, "addr" => addr, "ts" => ts, "prekey" => fast, "nonce" => hello, "role" => 0, "salt" => Null }, None).unwrap();
-  }
-  let nonce = box_::gen_nonce();
-  println!("HELLO {:?}", pkey );
-  let rslt = json!({
-    "hello": encode(&pkey),
-    "nonce": encode(&nonce),
-  });
+  println!("HELLO {:?} {:?} {:?}", cmd.key, cmd.addr, cmd.state);
   Ok(rslt)
 }
